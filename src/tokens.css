@@ -1,0 +1,61 @@
+/* @singularityfp/theme — semantic design tokens (light + dark).
+   Import ONCE per app, right after the @tailwind directives in app/globals.css:
+       @tailwind base; @tailwind components; @tailwind utilities;
+       @import '@singularityfp/theme/tokens.css';
+   Core neutrals/accent are "R G B" channels so Tailwind /opacity modifiers work
+   (text-fg/60). Light values are pinned to the canonical palette so an already-
+   light app stays pixel-identical; only dark mode is new. */
+@layer base {
+  :root {
+    --brand-cream: #f5f4f0;
+    --brand-teal:  #4ecdb4;
+    --brand-navy:  #1c2333;
+
+    --bg:        245 244 240;   /* #F5F4F0 page background */
+    --surface:   255 255 255;   /* #FFFFFF cards/panels */
+    --surface-2: 250 250 247;   /* #FAFAF7 zebra/hover rows */
+    --fg:         28  35  51;   /* #1C2333 primary text */
+    --line:      229 231 235;   /* #E5E7EB hairline borders */
+    --accent:     78 205 180;   /* #4ECDB4 teal fill */
+
+    --fg-muted:     #6b7280;
+    --fg-subtle:    #9ca3af;
+    --accent-text:  #0f766e;
+    --on-accent:    #1c2333;
+    --selected-bg:  #1c2333;
+    --selected-fg:  #f5f4f0;
+
+    color-scheme: light;
+  }
+
+  :root[data-theme="dark"],
+  .dark {
+    --bg:        11  14  20;
+    --surface:   17  21  31;
+    --surface-2: 22  28  41;
+    --fg:       245 244 240;
+    --line:      35  42  58;
+    --accent:    78 205 180;
+
+    --fg-muted:     #9aa1b0;
+    --fg-subtle:    #6f7989;
+    --accent-text:  #5fd6c0;
+    --on-accent:    #06080a;
+    --selected-bg:  #4ecdb4;
+    --selected-fg:  #06080a;
+
+    color-scheme: dark;
+  }
+
+  html, body {
+    background-color: rgb(var(--bg));
+    color: rgb(var(--fg));
+    font-family: 'DM Sans', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+
+  h1, h2, h3 { font-family: 'Instrument Serif', Georgia, serif; letter-spacing: -0.01em; }
+  code, pre { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+}
