@@ -1,3 +1,5 @@
+node_modules/
+*.tgz
 .manifest/state.json
 .manifest/.last-test-results-snapshot.json
 actions-runner-*/
