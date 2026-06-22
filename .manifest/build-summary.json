@@ -1,4 +1,7 @@
 {
   "androidIncludedVia": null,
-  "subPlatformsTested": []
+  "subPlatformsTested": [],
+  "testsPassing": 0,
+  "testsTotal": null,
+  "testResultsSource": "commit-message-parse"
 }
