@@ -23,11 +23,17 @@ per-app palette drift.
 
 ## Install
 
-```bash
-npm install @singularityfp/theme
+Distributed from this **public GitHub repo** (not an npm registry). Use the explicit
+`git+https` form — **not** the `github:` shorthand, which npm resolves over SSH and
+fails in credential-less build sandboxes (e.g. Vercel) with `Permission denied (publickey)`:
+
+```jsonc
+// package.json → dependencies
+"@singularityfp/theme": "git+https://github.com/AgenticWays/singularity-theme.git#v0.1.0"
 ```
 
 Peer dependencies: `react >= 18`, `tailwindcss >= 3.4.1`.
+Dev dependency for adoption: `postcss-import` (see step 2).
 
 ## Adoption — 4 steps
 
@@ -43,19 +49,36 @@ const nextConfig = {
 module.exports = nextConfig;
 ```
 
-### 2. Import the token CSS (after the `@tailwind` directives)
+### 2. Import the token CSS (ABOVE the `@tailwind` directives)
+
+The `@import` must be the **first statement in the file, above `@tailwind`** (CSS
+requires `@import` to precede other rules), and your PostCSS pipeline needs
+`postcss-import` listed **before** `tailwindcss` so the package CSS is inlined into
+the bundle:
 
 ```css
 /* app/globals.css */
+@import '@singularityfp/theme/tokens.css';
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+```
 
-@import '@singularityfp/theme/tokens.css';
+```js
+// postcss.config.js
+module.exports = { plugins: { 'postcss-import': {}, tailwindcss: {}, autoprefixer: {} } };
+```
+
+```bash
+npm install -D postcss-import
 ```
 
 This exposes `--bg / --surface / --fg / --line / --accent / …` and flips them
 under both `[data-theme="dark"]` and `.dark`.
+
+> **Gotcha (cost a failed build):** if the `@import` sits *below* the `@tailwind`
+> directives, or `postcss-import` is missing/ordered after `tailwindcss`, the tokens
+> silently never reach the compiled stylesheet and dark mode won't flip.
 
 ### 3. Add the Tailwind preset
 
@@ -108,7 +131,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 
 ## Public-surface examples (one per feature)
 
-**Token CSS** — import once, right after the `@tailwind` directives:
+**Token CSS** — import once, as the first line, **above** the `@tailwind` directives (requires `postcss-import`):
 
 ```css
 @import '@singularityfp/theme/tokens.css';
