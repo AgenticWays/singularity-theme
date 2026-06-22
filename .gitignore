@@ -1,0 +1,6 @@
+.manifest/state.json
+.manifest/.last-test-results-snapshot.json
+actions-runner-*/
+_work/
+_diag/
+_temp/

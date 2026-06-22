@@ -1,0 +1,7 @@
+{
+  "platform": "server",
+  "github": {
+    "org": "AgenticWays"
+  },
+  "runner_label": "singularity-theme-runner"
+}

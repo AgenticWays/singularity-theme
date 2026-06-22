@@ -1,0 +1,264 @@
+name: 'Manifest CLI Run'
+description: 'Reusable composite action that executes a manifest CLI command, captures stdout, uploads logs, exits with the CLI exit code, and tees the build log to ~/.manifest/runs/<project>/issue-<n>/build.log when co-located with the MCP server (PRD #49 + PRD task-list-backend-and-issue-log-path ILP-003).'
+
+inputs:
+  command:
+    description: 'The manifest CLI command to run (build, extract, feature, e2e, status, publish)'
+    required: true
+  project_name:
+    description: 'The project name (use "." to run in current directory with --cwd)'
+    required: false
+    default: '.'
+  use_cwd:
+    description: 'Use --cwd flag to override project directory (set to false to use ~/clawd/projects/<project_name>)'
+    required: false
+    default: 'false'
+  platform:
+    description: 'Target platform (ios, android, web, pwa, all)'
+    required: false
+    default: 'all'
+  flags:
+    description: 'Additional CLI flags to pass to the manifest command'
+    required: false
+    default: ''
+  issue_number:
+    description: 'Feature-queue issue number (enables ~/.manifest/runs/issue-<n>/ local-log tee for PRD #49). When empty, falls back to run-<run_id>/ naming.'
+    required: false
+    default: ''
+
+outputs:
+  exit_code:
+    description: 'The exit code from the manifest CLI command'
+    value: ${{ steps.run-manifest.outputs.exit_code }}
+  log_file:
+    description: 'Path to the captured log file'
+    value: ${{ steps.run-manifest.outputs.log_file }}
+  duration:
+    description: 'Duration of the CLI execution in seconds'
+    value: ${{ steps.run-manifest.outputs.duration }}
+  local_log_path:
+    description: 'Path under ~/.manifest/runs/ where the build log was tee''d (if available to co-located MCP)'
+    value: ${{ steps.prepare-local-run.outputs.local_log_path }}
+
+# ─────────────────────────────────────────────────────────────────────────
+# PRD #49: GitHub Actions Build Status Bridge
+#
+# The `Prepare manifest-runs dir` and `Write manifest-runs meta.json` steps
+# below stage a local log at ~/.manifest/runs/issue-<n>/build.log so the
+# co-located manifest MCP server (same host as this self-hosted runner)
+# can tail build output in real time instead of waiting ~30-60s for the
+# GitHub Actions log indexer.
+#
+# If this `tee` is accidentally removed, the MCP will silently fall back
+# to the GH API zip path — technically still correct, but the sub-second
+# UX property is load-bearing. The MANIFEST_COLOCATED_RUNNERS env var on
+# the MCP process triggers a `local_log_missing` warning when it expected
+# a local log but found none — that is the detection mechanism.
+# ─────────────────────────────────────────────────────────────────────────
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Prepare log directory
+      shell: bash
+      run: |
+        mkdir -p .manifest/logs
+        LOG_FILE=".manifest/logs/manifest-${GITHUB_RUN_ID:-local}-$(date +%Y%m%d%H%M%S).log"
+        echo "LOG_FILE=$LOG_FILE" >> "$GITHUB_ENV"
+
+    - name: Prepare manifest-runs dir (local log tee)
+      id: prepare-local-run
+      shell: bash
+      env:
+        ISSUE_NUMBER: ${{ inputs.issue_number }}
+        PROJECT_NAME: ${{ inputs.project_name }}
+      run: |
+        set -eu
+        MANIFEST_RUNS_ROOT="${HOME}/.manifest/runs"
+        mkdir -p "$MANIFEST_RUNS_ROOT"
+        chmod 700 "$MANIFEST_RUNS_ROOT"
+
+        # PRD task-list-backend-and-issue-log-path ILP-003 — namespace
+        # the per-issue run dir by project slug so two projects building
+        # Issue #1 simultaneously cannot overwrite each other's
+        # build.log / meta.json. Fall back to "default" when the
+        # composite action is invoked without project_name (e.g. by an
+        # older scaffolded workflow that hasn't been re-rendered).
+        PROJECT_SLUG="${PROJECT_NAME:-default}"
+        PROJECT_SLUG="${PROJECT_SLUG#.}"
+        if [[ -z "$PROJECT_SLUG" || "$PROJECT_SLUG" == "." ]]; then
+          PROJECT_SLUG="default"
+        fi
+
+        if [[ -n "${ISSUE_NUMBER}" ]]; then
+          RUN_SLUG="${PROJECT_SLUG}/issue-${ISSUE_NUMBER}"
+        else
+          # Unknown issue (e.g. a feature-queue drain iteration covering multiple
+          # issues at once) — fall back to a run-id-scoped directory. Still
+          # readable by the MCP, just not resolvable by issue number.
+          RUN_SLUG="${PROJECT_SLUG}/run-${GITHUB_RUN_ID}"
+        fi
+
+        LOCAL_RUN_DIR="${MANIFEST_RUNS_ROOT}/${RUN_SLUG}"
+        LOCAL_LOG_PATH="${LOCAL_RUN_DIR}/build.log"
+        LOCAL_META_PATH="${LOCAL_RUN_DIR}/meta.json"
+
+        mkdir -p "$LOCAL_RUN_DIR"
+        chmod 700 "$LOCAL_RUN_DIR"
+        # Truncate / create the log file at the start of this step so we
+        # always get a fresh-file mtime that satisfies the MCP freshness gate.
+        : > "$LOCAL_LOG_PATH"
+        chmod 600 "$LOCAL_LOG_PATH"
+
+        echo "MANIFEST_LOCAL_RUN_DIR=$LOCAL_RUN_DIR" >> "$GITHUB_ENV"
+        echo "MANIFEST_LOCAL_LOG_PATH=$LOCAL_LOG_PATH" >> "$GITHUB_ENV"
+        echo "MANIFEST_LOCAL_META_PATH=$LOCAL_META_PATH" >> "$GITHUB_ENV"
+        echo "local_log_path=$LOCAL_LOG_PATH" >> "$GITHUB_OUTPUT"
+
+    - name: Write manifest-runs meta.json (start)
+      shell: bash
+      env:
+        ISSUE_NUMBER: ${{ inputs.issue_number }}
+      run: |
+        set -eu
+        : "${MANIFEST_LOCAL_META_PATH:?missing}"
+        STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+        # Prefer jq; if missing (non-self-hosted edge case), write via heredoc.
+        if command -v jq >/dev/null 2>&1; then
+          jq -n \
+            --arg issue_number "${ISSUE_NUMBER}" \
+            --arg run_id "${GITHUB_RUN_ID}" \
+            --arg run_attempt "${GITHUB_RUN_ATTEMPT:-1}" \
+            --arg job_id "${GITHUB_JOB}" \
+            --arg started_at "${STARTED_AT}" \
+            --arg host "$(hostname)" \
+            --arg runner_name "${RUNNER_NAME:-unknown}" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            '{issue_number: (if $issue_number == "" then null else ($issue_number|tonumber) end),
+              run_id: ($run_id|tonumber),
+              run_attempt: ($run_attempt|tonumber),
+              job_id: $job_id,
+              started_at: $started_at,
+              host: $host,
+              runner_name: $runner_name,
+              repository: $repository}' > "$MANIFEST_LOCAL_META_PATH"
+        else
+          cat <<EOF > "$MANIFEST_LOCAL_META_PATH"
+        {
+          "issue_number": ${ISSUE_NUMBER:-null},
+          "run_id": ${GITHUB_RUN_ID},
+          "run_attempt": ${GITHUB_RUN_ATTEMPT:-1},
+          "job_id": "${GITHUB_JOB}",
+          "started_at": "${STARTED_AT}",
+          "host": "$(hostname)",
+          "runner_name": "${RUNNER_NAME:-unknown}",
+          "repository": "${GITHUB_REPOSITORY}"
+        }
+        EOF
+        fi
+
+        chmod 600 "$MANIFEST_LOCAL_META_PATH"
+
+    - name: Run manifest CLI
+      id: run-manifest
+      shell: bash
+      run: |
+        set -o pipefail
+        START_TIME=$(date +%s)
+        LOG_FILE="${LOG_FILE:-.manifest/logs/manifest-local.log}"
+        LOCAL_LOG_PATH="${MANIFEST_LOCAL_LOG_PATH:-/dev/null}"
+
+        # Build the command
+        CMD="manifest ${{ inputs.command }} ${{ inputs.project_name }}"
+
+        # Add --cwd flag to use current checkout directory (critical for GitHub Actions)
+        if [[ "${{ inputs.use_cwd }}" == "true" ]]; then
+          CMD="$CMD --cwd $(pwd)"
+          echo "Using --cwd $(pwd) to build in checkout directory"
+        fi
+
+        # Add platform flag if not the default 'all' or if command is build/e2e/publish
+        if [[ "${{ inputs.platform }}" != "all" ]]; then
+          CMD="$CMD --platform ${{ inputs.platform }}"
+        fi
+
+        # Add any extra flags
+        if [[ -n "${{ inputs.flags }}" ]]; then
+          CMD="$CMD ${{ inputs.flags }}"
+        fi
+
+        echo "::group::Running: $CMD"
+        echo "Command: $CMD" | tee "$LOG_FILE" "$LOCAL_LOG_PATH" >/dev/null
+        echo "Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$LOG_FILE" "$LOCAL_LOG_PATH" >/dev/null
+        echo "---" | tee -a "$LOG_FILE" "$LOCAL_LOG_PATH" >/dev/null
+
+        # Execute the command, streaming stdout to console + both log destinations.
+        # PRD #49: the append to $LOCAL_LOG_PATH is what the co-located MCP server
+        # tails for sub-second log visibility.
+        EXIT_CODE=0
+        eval "$CMD" 2>&1 | tee -a "$LOG_FILE" "$LOCAL_LOG_PATH" || EXIT_CODE=$?
+
+        END_TIME=$(date +%s)
+        DURATION=$((END_TIME - START_TIME))
+
+        echo "---" | tee -a "$LOG_FILE" "$LOCAL_LOG_PATH" >/dev/null
+        echo "Finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$LOG_FILE" "$LOCAL_LOG_PATH" >/dev/null
+        echo "Duration: ${DURATION}s" | tee -a "$LOG_FILE" "$LOCAL_LOG_PATH" >/dev/null
+        echo "Exit code: $EXIT_CODE" | tee -a "$LOG_FILE" "$LOCAL_LOG_PATH" >/dev/null
+        echo "::endgroup::"
+
+        # Set outputs
+        echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+        echo "log_file=$LOG_FILE" >> "$GITHUB_OUTPUT"
+        echo "duration=$DURATION" >> "$GITHUB_OUTPUT"
+
+        exit $EXIT_CODE
+
+    - name: Finalize manifest-runs meta.json
+      if: always()
+      shell: bash
+      env:
+        JOB_STATUS: ${{ job.status }}
+      run: |
+        set -eu
+        META_PATH="${MANIFEST_LOCAL_META_PATH:-}"
+        if [[ -z "$META_PATH" ]] || [[ ! -f "$META_PATH" ]]; then
+          echo "No meta.json to finalize (step may have been skipped)"
+          exit 0
+        fi
+
+        COMPLETED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        # Conclusion mirrors job.status: success | failure | cancelled | skipped
+        CONCLUSION="${JOB_STATUS:-unknown}"
+
+        if command -v jq >/dev/null 2>&1; then
+          tmp="$(mktemp)"
+          jq --arg completed_at "$COMPLETED_AT" --arg conclusion "$CONCLUSION" \
+            '. + {completed_at: $completed_at, conclusion: $conclusion}' \
+            "$META_PATH" > "$tmp"
+          mv "$tmp" "$META_PATH"
+        else
+          # Best-effort append without jq (shouldn't be hit on self-hosted mac runners).
+          # Strip trailing `}` then re-emit with new keys.
+          python3 - <<PY
+        import json, os
+        p = os.environ["META_PATH"]
+        with open(p) as f:
+            meta = json.load(f)
+        meta["completed_at"] = os.environ["COMPLETED_AT"]
+        meta["conclusion"] = os.environ["CONCLUSION"]
+        with open(p, "w") as f:
+            json.dump(meta, f)
+        PY
+        fi
+
+        chmod 600 "$META_PATH"
+
+    - name: Upload log artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: manifest-log-${{ github.run_id }}
+        path: .manifest/logs/
+        retention-days: 30

@@ -1,0 +1,462 @@
+name: Manifest Feature Build (Issue)
+run-name: "Feature [${{ github.event_name }}] — ${{ inputs.issue_number || github.event.issue.number || github.event.pull_request.number }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number containing Feature PRD'
+        required: true
+        type: number
+
+  issues:
+    types: [labeled]
+
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: feature-queue-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  PROJECT_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  feature-build:
+    name: Build Feature from Issue
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'issues' &&
+        github.event.label.name == 'ready' &&
+        (
+          contains(github.event.issue.labels.*.name, 'feature-prd') ||
+          contains(github.event.issue.labels.*.name, 'bug-fix') ||
+          contains(github.event.issue.labels.*.name, 'enhancement') ||
+          contains(github.event.issue.labels.*.name, 'task-mode')
+        )
+      )
+    runs-on: [self-hosted, singularity-theme-runner]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine issue number
+        id: issue
+        env:
+          DISPATCH_ISSUE_NUMBER: ${{ inputs.issue_number }}
+          EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            ISSUE_NUMBER="$DISPATCH_ISSUE_NUMBER"
+          else
+            ISSUE_NUMBER="$EVENT_ISSUE_NUMBER"
+          fi
+
+          if [[ -z "$ISSUE_NUMBER" ]]; then
+            echo "::error::issue_number is required"
+            exit 1
+          fi
+
+          echo "number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Validate issue
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          LABELS=$(gh issue view "$ISSUE_NUMBER" --json labels -q '.labels[].name')
+          if ! echo "$LABELS" | grep -qE '^(feature-prd|bug-fix|enhancement|task-mode)$'; then
+            echo "::error::Issue #$ISSUE_NUMBER does not have a feature-queue type label (feature-prd, bug-fix, enhancement, task-mode)"
+            exit 1
+          fi
+
+          if echo "$LABELS" | grep -q "^completed$"; then
+            echo "::warning::Issue #$ISSUE_NUMBER already has 'completed' label — skipping build"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+
+      # PRD #71 TASK-301 — choose a 🎯 Task badge vs 🔨 Feature badge.
+      # Cosmetic only. Reads the issue's labels via gh and writes a
+      # static literal ('🎯 Task' or '🔨 Feature') to step output —
+      # never reflects untrusted issue body/title text.
+      - name: Detect task mode
+        id: mode
+        if: steps.validate.outputs.skipped != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          LABELS=$(gh issue view "$ISSUE_NUMBER" --json labels -q '.labels[].name')
+          if echo "$LABELS" | grep -qx 'task-mode'; then
+            echo "badge=🎯 Task" >> "$GITHUB_OUTPUT"
+            echo "is_task=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "badge=🔨 Feature" >> "$GITHUB_OUTPUT"
+            echo "is_task=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post build started comment
+        if: steps.validate.outputs.skipped != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          BADGE: ${{ steps.mode.outputs.badge }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --body "$(cat <<EOF
+          ## ${BADGE} Build Started
+
+          **Run:** [#${RUN_ID}](${RUN_URL})
+          **Triggered by:** ${EVENT_NAME}
+          **Started at:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+          )"
+
+      - name: Post skip comment
+        if: steps.validate.outputs.skipped == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --body "⚠️ Build skipped — this issue already has the \`completed\` label."
+
+      - name: Run manifest feature build-issue
+        if: steps.validate.outputs.skipped != 'true'
+        id: manifest
+        uses: ./.github/actions/manifest-run
+        with:
+          command: 'feature build-issue'
+          project_name: 'singularity-theme'
+          use_cwd: 'false'
+          flags: ${{ steps.issue.outputs.number }}
+          issue_number: ${{ steps.issue.outputs.number }}
+
+      # NOTE: Commits are now in ~/clawd/projects/singularity-theme (actual project dir)
+      # Auto-push + auto-PR creation for full automation
+
+      # MPFB-F02 — pre-push file-size safety check. Catches runner tarballs
+      # / bundled binaries / large generated artifacts BEFORE `git push`
+      # hits GitHub's 100 MB pre-receive cap. Without this, push fails
+      # after the commit is authored and the operator has to git rm --cached
+      # + amend + push again. 50–100 MB emits a warning; >100 MB fails.
+      - name: Pre-push file-size safety check
+        if: steps.validate.outputs.skipped != 'true' && success()
+        run: |
+          set -e
+          PROJECT_DIR="${MANIFEST_PROJECTS_DIR:-$HOME/clawd/projects}/singularity-theme"
+          cd "$PROJECT_DIR"
+          BIG=$(git ls-files | xargs -I{} stat -f '%z %N' "{}" 2>/dev/null | awk '$1 > 100*1024*1024 {print}')
+          WARN=$(git ls-files | xargs -I{} stat -f '%z %N' "{}" 2>/dev/null | awk '$1 > 50*1024*1024 && $1 <= 100*1024*1024 {print}')
+          if [[ -n "$BIG" ]]; then
+            echo "::error::Files exceed GitHub's 100 MB limit:"
+            echo "$BIG"
+            echo "::error::Add these paths to .gitignore and run 'git rm --cached <file>'."
+            exit 1
+          fi
+          if [[ -n "$WARN" ]]; then
+            echo "::warning::Files between 50-100 MB detected:"
+            echo "$WARN"
+          fi
+
+      - name: Auto-push and create PR
+        if: steps.validate.outputs.skipped != 'true' && success()
+        id: auto-pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          set -e
+          PROJECT_DIR="${MANIFEST_PROJECTS_DIR:-$HOME/clawd/projects}/singularity-theme"
+          echo "Resolved PROJECT_DIR: $PROJECT_DIR"
+          cd "$PROJECT_DIR"
+          # PRD #186 FUI-001 — capture the repo's actual default branch
+          # so this workflow works on both `master`- and `main`-default
+          # repos without re-scaffolding. Resolved at workflow runtime
+          # from the GitHub event payload (NOT a scaffold-time literal).
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+
+          # Check if there are any commits to push
+          git fetch origin "$DEFAULT_BRANCH" --quiet
+          COMMITS_AHEAD=$(git rev-list --count "origin/${DEFAULT_BRANCH}..HEAD" 2>/dev/null || echo "0")
+
+          if [[ "$COMMITS_AHEAD" == "0" ]]; then
+            echo "No new commits to push — skipping PR creation"
+            echo "pr_created=false" >> "$GITHUB_OUTPUT"
+            echo "pr_url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Get issue title for branch name and PR title
+          ISSUE_TITLE=$(gh issue view "$ISSUE_NUMBER" --json title -q '.title')
+
+          # Create a sanitized branch name from issue title
+          BRANCH_NAME="feature/issue-${ISSUE_NUMBER}-$(echo "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd '[:alnum:]-' | head -c 50)"
+
+          # Create and checkout the feature branch from current HEAD
+          git checkout -b "$BRANCH_NAME" 2>/dev/null || git checkout "$BRANCH_NAME"
+
+          # Push the branch to origin
+          git push -u origin "$BRANCH_NAME" --force-with-lease
+
+          # Create PR with link to issue
+          PR_BODY="## Summary
+
+          Automated implementation for Issue #${ISSUE_NUMBER}.
+
+          ## Linked Issue
+
+          Closes #${ISSUE_NUMBER}
+
+          ## Generated by
+
+          🤖 ManifestAgent via GitHub Actions workflow"
+
+          PR_URL=$(gh pr create \
+            --title "feat(issue-${ISSUE_NUMBER}): ${ISSUE_TITLE}" \
+            --body "$PR_BODY" \
+            --base "$DEFAULT_BRANCH" \
+            --head "$BRANCH_NAME" 2>&1) || {
+            # PR might already exist
+            EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --json url -q '.[0].url')
+            if [[ -n "$EXISTING_PR" ]]; then
+              PR_URL="$EXISTING_PR"
+              echo "PR already exists: $PR_URL"
+            else
+              echo "::error::Failed to create PR"
+              exit 1
+            fi
+          }
+
+          echo "pr_created=true" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "branch_name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+          echo "commits_count=$COMMITS_AHEAD" >> "$GITHUB_OUTPUT"
+
+      # PRD — record runner-opened PR identity onto state.json so a
+      # follow-up manifest_merge_pr (no prNumber) can resolve it.
+      # Best-effort: never fails the workflow even if the persist exits
+      # non-zero. PR_URL is sourced via env from the prior step output
+      # (controlled GitHub-API value), not from untrusted issue text.
+      - name: Persist PR identity to state.json
+        if: steps.validate.outputs.skipped != 'true' && success() && steps.auto-pr.outputs.pr_created == 'true'
+        env:
+          PROJECT_NAME: singularity-theme
+          PR_URL: ${{ steps.auto-pr.outputs.pr_url }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          PROJECT_DIR="${MANIFEST_PROJECTS_DIR:-$HOME/clawd/projects}/singularity-theme"
+          echo "Resolved PROJECT_DIR: $PROJECT_DIR"
+          cd "$PROJECT_DIR"
+
+          PR_NUMBER=$(printf '%s' "$PR_URL" | sed -nE 's|.*/pull/([0-9]+).*|\1|p')
+          if [[ -z "$PR_NUMBER" ]]; then
+            PR_NUMBER=$(gh pr view "$PR_URL" --json number -q '.number' 2>/dev/null || true)
+          fi
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "::warning::Could not parse PR number from PR_URL — skipping persist-pr"
+            exit 0
+          fi
+          node "$PROJECT_DIR/dist/cli/index.js" internal persist-pr \
+            --project "$PROJECT_NAME" \
+            --number "$PR_NUMBER" \
+            --url "$PR_URL" || \
+            echo "::warning::manifest internal persist-pr failed (best-effort) — continuing"
+
+      - name: Update issue labels on success
+        if: steps.validate.outputs.skipped != 'true' && success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          # Transition labels: remove 'building' and 'ready', add 'completed'
+          gh issue edit "$ISSUE_NUMBER" \
+            --add-label "completed" \
+            --remove-label "building" \
+            --remove-label "ready" 2>/dev/null || true
+
+      - name: Post build success comment
+        if: steps.validate.outputs.skipped != 'true' && success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PR_CREATED: ${{ steps.auto-pr.outputs.pr_created }}
+          PR_URL: ${{ steps.auto-pr.outputs.pr_url }}
+          BRANCH_NAME: ${{ steps.auto-pr.outputs.branch_name }}
+          COMMITS_COUNT: ${{ steps.auto-pr.outputs.commits_count }}
+        run: |
+          if [[ "$PR_CREATED" == "true" ]]; then
+            gh issue comment "$ISSUE_NUMBER" --body "$(cat <<EOF
+          ## ✅ Build Succeeded — PR Created!
+
+          **Run:** [#${RUN_ID}](${RUN_URL})
+          **Completed at:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          ### 🚀 Auto-PR
+
+          | Field | Value |
+          |-------|-------|
+          | **PR** | ${PR_URL} |
+          | **Branch** | \`${BRANCH_NAME}\` |
+          | **Commits** | ${COMMITS_COUNT} |
+
+          Transitioned to \`completed\`. Review and merge the PR when ready!
+          EOF
+          )"
+          else
+            gh issue comment "$ISSUE_NUMBER" --body "$(cat <<EOF
+          ## ✅ Build Succeeded
+
+          **Run:** [#${RUN_ID}](${RUN_URL})
+          **Completed at:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          No new commits were created during this build.
+          Transitioned to \`completed\`.
+          EOF
+          )"
+          fi
+
+      - name: Post build failure comment
+        if: steps.validate.outputs.skipped != 'true' && failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue edit "$ISSUE_NUMBER" --add-label "build-failed" --remove-label "building" --remove-label "ready" 2>/dev/null || true
+
+          gh issue comment "$ISSUE_NUMBER" --body "$(cat <<EOF
+          ## ❌ Build Failed
+
+          **Run:** [#${RUN_ID}](${RUN_URL})
+          **Failed at:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          Check the [workflow logs](${RUN_URL}) for details.
+          EOF
+          )"
+
+      # PRD #64 — Cleanup is a dedicated step so a checkout failure here
+      # cannot conflate with the real build outcome. Two flags work together:
+      #   if: always()           — run even when prior steps failed, so the
+      #                            runner is always left on a clean default branch.
+      #   continue-on-error:true — swallow this step's own failure, so it
+      #                            cannot turn a successful build into
+      #                            `build-failed` (the recurring bug in PRDs
+      #                            #56, #58, #60, #61, #62, #63).
+      - name: Cleanup runner branch state
+        if: always()
+        continue-on-error: true
+        run: |
+          PROJECT_DIR="${MANIFEST_PROJECTS_DIR:-$HOME/clawd/projects}/singularity-theme"
+          echo "Resolved PROJECT_DIR: $PROJECT_DIR"
+          cd "$PROJECT_DIR" || exit 0
+          # PRD #186 FUI-001 — resolve the repo's actual default branch
+          # at runtime; the scaffold-time literal is gone.
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          # Stash any pending .manifest/state.json change first so the
+          # checkout doesn't fail. State.json is per-runner state (cursor +
+          # currentFeature timing) — gitignored intent, historically tracked.
+          # --include-untracked covers the first-build-of-the-day case where
+          # state.json is newly created.
+          git stash push --include-untracked -m "singularity-theme-cleanup-stash" -- .manifest/state.json || true
+          git checkout "$DEFAULT_BRANCH"
+          # Drop the stash so it doesn't accumulate across runs on self-
+          # hosted runners (which persist working state between builds).
+          # 2>/dev/null || true swallows the "no stash entries found" error
+          # on no-op runs (when state.json was already clean).
+          git stash drop stash@{0} 2>/dev/null || true
+
+      - name: Job summary
+        if: always()
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          EVENT_NAME: ${{ github.event_name }}
+          SKIPPED: ${{ steps.validate.outputs.skipped }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo ""
+            echo "## Feature Issue Build Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| **Issue** | #${ISSUE_NUMBER} |"
+            echo "| **Trigger** | ${EVENT_NAME} |"
+            echo "| **Skipped** | ${SKIPPED} |"
+            echo "| **Status** | ${JOB_STATUS} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  close-on-merge:
+    name: Transition Issue on PR Merge
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Parse linked issue from PR body
+        id: parse
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Match the first "Closes #<n>", "Fixes #<n>", or "Resolves #<n>" (case-insensitive)
+          ISSUE_NUMBER=$(printf '%s' "$PR_BODY" | grep -iEo '(closes|fixes|resolves)[[:space:]]+#[0-9]+' | head -n1 | grep -Eo '[0-9]+' || true)
+
+          if [[ -z "$ISSUE_NUMBER" ]]; then
+            echo "No linked issue found in PR body — skipping"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Found linked issue #$ISSUE_NUMBER"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Transition issue to completed
+        if: steps.parse.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.parse.outputs.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          # Check if issue has a feature-queue type label before transitioning
+          LABELS=$(gh issue view "$ISSUE_NUMBER" --json labels -q '.labels[].name' 2>/dev/null || echo "")
+          if ! echo "$LABELS" | grep -qE '^(feature-prd|bug-fix|enhancement)$'; then
+            echo "Issue #$ISSUE_NUMBER is not a feature-queue issue — skipping transition"
+            exit 0
+          fi
+
+          gh issue edit "$ISSUE_NUMBER" --add-label "completed" --remove-label "building" --remove-label "ready" 2>/dev/null || true
+
+          gh issue comment "$ISSUE_NUMBER" --body "$(cat <<EOF
+          ## ✅ Merged
+
+          **PR:** ${PR_URL}
+          **Merge commit:** \`${MERGE_SHA}\`
+          **Merged at:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          Transitioned to \`completed\`.
+          EOF
+          )"
